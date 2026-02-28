@@ -15,15 +15,18 @@ A Slack bot that **enforces mandatory swearing** in designated channels. If some
 ## Architecture
 
 ```
-Slack → Lambda Function URL → handler.py → Claude API
-                                  ↓
-                          AWS Secrets Manager
+Slack → Lambda Function URL → handler.py ──→ return 200 immediately
+                                  │
+                                  └──→ async self-invoke ──→ Claude API
+                                                              ↓
+                                                      rewrite + repost
 ```
 
 - **Runtime:** Python 3.12 on AWS Lambda
 - **Secrets:** AWS Secrets Manager (`slack-filth-bot/secrets`)
 - **Infra:** SAM/CloudFormation (template.yaml)
 - **No database** — channel rules are cached in Lambda memory and refreshed from Slack channel topics
+- **Async processing** — Slack requires a 200 response within 3 seconds. The handler returns 200 immediately and re-invokes itself asynchronously (`InvocationType='Event'`) to perform the Claude rewrite and Slack API calls. If the async invocation fails, it falls back to synchronous processing.
 
 ## Prerequisites
 
@@ -118,11 +121,16 @@ If the bot can't delete a message (missing permissions), it replies in a thread 
 > 🧼 Too clean! Here's what you *should* have said:
 > > [filthy version]
 
-## Local Testing
+## Testing
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirements.txt pytest
+pytest test_handler.py -v
+```
 
+### Local Integration Testing
+
+```bash
 # Set env vars for local testing
 export SECRET_NAME=slack-filth-bot/secrets
 export AWS_REGION=eu-west-2
@@ -136,7 +144,7 @@ sam local invoke FilthEnforcerFunction -e test-event.json
 Extremely low. Each invocation:
 - ~200ms Lambda execution (~$0.000004)
 - 1 Secrets Manager call (cached on warm starts)
-- 1 Claude Sonnet API call for rewrites only (~$0.003 per rewrite)
+- 1 Claude Sonnet 4.5 API call for rewrites only (~$0.003 per rewrite)
 - Slack API calls (free)
 
 For a channel with 100 messages/day where 20% need rewriting: ~$2/month.

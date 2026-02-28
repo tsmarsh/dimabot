@@ -19,8 +19,6 @@ import re
 import hashlib
 import hmac
 import time
-from functools import lru_cache
-
 import boto3
 import anthropic
 from slack_sdk import WebClient
@@ -142,7 +140,7 @@ def rewrite_message(text: str, regex_pattern: str) -> str:
     claude = get_claude_client()
 
     response = claude.messages.create(
-        model="claude-sonnet-4-5-20250929",
+        model="claude-sonnet-4-5",
         max_tokens=500,
         system=REWRITE_PROMPT.format(regex_pattern=regex_pattern),
         messages=[
@@ -161,21 +159,30 @@ def rewrite_message(text: str, regex_pattern: str) -> str:
 
 
 def verify_slack_signature(headers: dict, body: str) -> bool:
-    """Verify the request came from Slack using signing secret."""
+    """Verify the request came from Slack using signing secret.
+
+    See: https://api.slack.com/authentication/verifying-requests-from-slack
+    """
     secrets = get_secrets()
     signing_secret = secrets["SLACK_SIGNING_SECRET"]
 
     timestamp = headers.get("x-slack-request-timestamp", "")
     slack_signature = headers.get("x-slack-signature", "")
 
+    if not timestamp or not slack_signature:
+        return False
+
     # Reject requests older than 5 minutes (replay attack protection)
-    if abs(time.time() - int(timestamp)) > 300:
+    try:
+        if abs(time.time() - int(timestamp)) > 300:
+            return False
+    except (ValueError, TypeError):
         return False
 
     sig_basestring = f"v0:{timestamp}:{body}"
     computed = (
         "v0="
-        + hmac.new(
+        + hmac.HMAC(
             signing_secret.encode(),
             sig_basestring.encode(),
             hashlib.sha256,
@@ -279,19 +286,40 @@ def handle_topic_change(event: dict):
 # ---------------------------------------------------------------------------
 
 
+def _dispatch_event(evt: dict):
+    """Route a Slack event to the appropriate handler."""
+    if evt.get("type") == "message":
+        if evt.get("subtype") == "channel_topic":
+            handle_topic_change(evt)
+        else:
+            handle_message_event(evt)
+
+
 def lambda_handler(event, context):
     """
     AWS Lambda handler for Slack Events API.
 
     Expects API Gateway proxy integration or Lambda Function URL.
+
+    Slack requires a 200 response within 3 seconds. Because Claude rewrites
+    and Slack API calls can exceed that, this handler responds immediately
+    and re-invokes itself asynchronously (InvocationType='Event') to do
+    the actual processing.
     """
-    # Parse the incoming request
+
+    # ── Async self-invocation (internal, no signature check needed) ──
+    if event.get("_async_processing"):
+        _dispatch_event(event["slack_event"])
+        return {"statusCode": 200, "body": "ok"}
+
+    # ── External request from Slack ──
     headers = {k.lower(): v for k, v in (event.get("headers") or {}).items()}
     body_str = event.get("body", "")
 
     # Handle base64 encoding from API Gateway
     if event.get("isBase64Encoded"):
         import base64
+
         body_str = base64.b64decode(body_str).decode("utf-8")
 
     # Verify Slack signature
@@ -301,7 +329,7 @@ def lambda_handler(event, context):
 
     body = json.loads(body_str)
 
-    # Handle Slack URL verification challenge
+    # Handle Slack URL verification challenge (must be synchronous)
     if body.get("type") == "url_verification":
         return {
             "statusCode": 200,
@@ -309,18 +337,22 @@ def lambda_handler(event, context):
             "body": json.dumps({"challenge": body["challenge"]}),
         }
 
-    # Handle events
+    # Handle event callbacks — respond 200 immediately, process async
     if body.get("type") == "event_callback":
         evt = body.get("event", {})
-        evt_type = evt.get("type")
 
-        if evt_type == "message":
-            # Check for topic change subtype
-            if evt.get("subtype") == "channel_topic":
-                handle_topic_change(evt)
-            else:
-                handle_message_event(evt)
-
-        return {"statusCode": 200, "body": "ok"}
+        try:
+            boto3.client("lambda").invoke(
+                FunctionName=context.function_name,
+                InvocationType="Event",
+                Payload=json.dumps(
+                    {"_async_processing": True, "slack_event": evt}
+                ),
+            )
+        except Exception as e:
+            logger.error(
+                f"Async self-invoke failed, processing synchronously: {e}"
+            )
+            _dispatch_event(evt)
 
     return {"statusCode": 200, "body": "ok"}
