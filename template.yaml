@@ -39,7 +39,7 @@ Resources:
             - Effect: Allow
               Action:
                 - lambda:InvokeFunction
-              Resource: !GetAtt FilthEnforcerFunction.Arn
+              Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:slack-filth-enforcer"
       FunctionUrlConfig:
         AuthType: NONE  # Slack verifies via signing secret
         Cors:
