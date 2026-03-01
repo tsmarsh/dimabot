@@ -28,6 +28,7 @@ if ! aws secretsmanager describe-secret --secret-id "$SECRET_NAME" --region "$RE
     echo ""
 
     read -rp "SLACK_BOT_TOKEN: " SLACK_BOT_TOKEN
+    read -rp "SLACK_USER_TOKEN: " SLACK_USER_TOKEN
     read -rp "SLACK_SIGNING_SECRET: " SLACK_SIGNING_SECRET
     read -rp "ANTHROPIC_API_KEY: " ANTHROPIC_API_KEY
 
@@ -36,6 +37,7 @@ if ! aws secretsmanager describe-secret --secret-id "$SECRET_NAME" --region "$RE
         --region "$REGION" \
         --secret-string "{
             \"SLACK_BOT_TOKEN\": \"$SLACK_BOT_TOKEN\",
+            \"SLACK_USER_TOKEN\": \"$SLACK_USER_TOKEN\",
             \"SLACK_SIGNING_SECRET\": \"$SLACK_SIGNING_SECRET\",
             \"ANTHROPIC_API_KEY\": \"$ANTHROPIC_API_KEY\"
         }"
