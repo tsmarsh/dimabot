@@ -1,12 +1,13 @@
 """
 Slack Filth Enforcer Bot — AWS Lambda Handler
 
-A Slack bot that reads channel topics for regex patterns, validates messages
-against them, and rewrites "too clean" messages using Claude. Designed for
-joke channels where swearing is mandatory.
+A Slack bot that reads channel topics for an opt-in marker, validates messages
+using Claude, and rewrites "too clean" messages with creative profanity.
 
-Channel topic format:
-    🤬 Swearing required | regex:/\b(fuck|shit|damn|arse|bollocks|bloody)\b/i
+Channel topic format (just include one of these anywhere in the topic):
+    🤬 Swearing required
+    swearing mandatory
+    filth enforced
 
 Deployment: AWS Lambda behind API Gateway (or Lambda Function URL)
 Secrets: AWS Secrets Manager
@@ -15,7 +16,6 @@ Secrets: AWS Secrets Manager
 import json
 import logging
 import os
-import re
 import hashlib
 import hmac
 import time
@@ -66,61 +66,60 @@ def get_claude_client() -> anthropic.Anthropic:
 
 
 # ---------------------------------------------------------------------------
-# Channel rule cache (regex extracted from topic)
+# Channel enforcement cache
 # ---------------------------------------------------------------------------
 
+# Opt-in markers — if the topic contains any of these (case-insensitive),
+# the channel is enforced. No regex required.
+_ENFORCEMENT_MARKERS = ("🤬", "swearing", "filth enforced", "profanity required")
+
 # In-memory cache — survives across warm Lambda invocations
-_channel_rules: dict[str, re.Pattern | None] = {}
-
-REGEX_TOPIC_PATTERN = re.compile(r"regex:\/(.*?)\/([gimsux]*)", re.IGNORECASE)
+_channel_enforced: dict[str, bool] = {}
 
 
-def extract_regex_from_topic(topic: str) -> re.Pattern | None:
-    """Parse a regex from a channel topic string like 'regex:/pattern/flags'."""
-    match = REGEX_TOPIC_PATTERN.search(topic)
-    if not match:
-        return None
-
-    pattern_str = match.group(1)
-    flags_str = match.group(2).lower()
-
-    flags = 0
-    if "i" in flags_str:
-        flags |= re.IGNORECASE
-    if "m" in flags_str:
-        flags |= re.MULTILINE
-    if "s" in flags_str:
-        flags |= re.DOTALL
-    if "x" in flags_str:
-        flags |= re.VERBOSE
-
-    try:
-        return re.compile(pattern_str, flags)
-    except re.error as e:
-        logger.warning(f"Invalid regex in topic: {pattern_str} — {e}")
-        return None
-
-
-def get_channel_rule(slack: WebClient, channel_id: str) -> re.Pattern | None:
-    """Get (and cache) the regex rule for a channel from its topic."""
-    if channel_id not in _channel_rules:
+def is_channel_enforced(slack: WebClient, channel_id: str) -> bool:
+    """Return True if the channel topic opts in to filth enforcement."""
+    if channel_id not in _channel_enforced:
         try:
             info = slack.conversations_info(channel=channel_id)
-            topic = info["channel"]["topic"]["value"]
-            _channel_rules[channel_id] = extract_regex_from_topic(topic)
-            logger.info(
-                f"Loaded rule for {channel_id}: {_channel_rules[channel_id]}"
-            )
+            topic = info["channel"]["topic"]["value"].lower()
+            enforced = any(marker.lower() in topic for marker in _ENFORCEMENT_MARKERS)
+            _channel_enforced[channel_id] = enforced
+            logger.info(f"Channel {channel_id} enforced={enforced}")
         except SlackApiError as e:
             logger.error(f"Failed to get channel info for {channel_id}: {e}")
-            _channel_rules[channel_id] = None
+            _channel_enforced[channel_id] = False
 
-    return _channel_rules.get(channel_id)
+    return _channel_enforced.get(channel_id, False)
 
 
-def invalidate_channel_rule(channel_id: str):
-    """Remove cached rule so it gets reloaded on next message."""
-    _channel_rules.pop(channel_id, None)
+def invalidate_channel_cache(channel_id: str):
+    """Remove cached enforcement status so it gets reloaded on next message."""
+    _channel_enforced.pop(channel_id, None)
+
+
+# ---------------------------------------------------------------------------
+# Claude profanity check
+# ---------------------------------------------------------------------------
+
+IS_PROFANE_PROMPT = """You are a profanity detector for a Slack channel that requires swearing.
+Answer with ONLY the single word YES or NO.
+YES = the message contains genuine swearing or profanity.
+NO  = the message is clean, polite, or only contains mild words like "damn" or "hell"."""
+
+
+def is_profane(text: str) -> bool:
+    """Ask Claude whether the message already contains sufficient profanity."""
+    claude = get_claude_client()
+    response = claude.messages.create(
+        model="claude-haiku-4-5",
+        max_tokens=5,
+        system=IS_PROFANE_PROMPT,
+        messages=[{"role": "user", "content": text}],
+    )
+    answer = response.content[0].text.strip().upper()
+    logger.info(f"is_profane({text[:40]!r}) → {answer}")
+    return answer.startswith("Y")
 
 
 # ---------------------------------------------------------------------------
@@ -137,18 +136,17 @@ Rules:
 - Keep roughly the same length — don't turn a short message into an essay.
 - Preserve any @mentions, links, and emoji exactly as they are.
 - If the message contains code blocks or formatted content, only modify the prose.
-- The rewrite must pass this regex: {regex_pattern}
 - Output ONLY the rewritten message, nothing else. No quotes, no preamble."""
 
 
-def rewrite_message(text: str, regex_pattern: str) -> str:
+def rewrite_message(text: str) -> str:
     """Use Claude to rewrite a clean message with appropriate filth."""
     claude = get_claude_client()
 
     response = claude.messages.create(
         model="claude-sonnet-4-5",
         max_tokens=500,
-        system=REWRITE_PROMPT.format(regex_pattern=regex_pattern),
+        system=REWRITE_PROMPT,
         messages=[
             {
                 "role": "user",
@@ -218,21 +216,20 @@ def handle_message_event(event: dict):
         return
 
     slack = get_slack_client()
-    pattern = get_channel_rule(slack, channel)
 
-    if pattern is None:
-        return  # No rule for this channel
+    if not is_channel_enforced(slack, channel):
+        return  # Channel not opted in
 
-    # Message passes the regex — it's filthy enough
-    if pattern.search(text):
-        logger.info(f"Message passes in {channel}")
+    # Ask Claude if the message is already profane enough
+    if is_profane(text):
+        logger.info(f"Message passes profanity check in {channel}")
         return
 
     # Too clean! Rewrite it.
     logger.info(f"Message too clean in {channel} from {user}: {text[:50]}...")
 
     try:
-        filthy_version = rewrite_message(text, pattern.pattern)
+        filthy_version = rewrite_message(text)
 
         # Get user info for attribution
         user_info = slack.users_info(user=user)
@@ -284,8 +281,8 @@ def handle_topic_change(event: dict):
     """Invalidate cache when a channel topic changes."""
     channel = event.get("channel")
     if channel:
-        invalidate_channel_rule(channel)
-        logger.info(f"Invalidated rule cache for {channel}")
+        invalidate_channel_cache(channel)
+        logger.info(f"Invalidated enforcement cache for {channel}")
 
 
 # ---------------------------------------------------------------------------

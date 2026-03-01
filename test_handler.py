@@ -3,7 +3,6 @@
 import hashlib
 import hmac
 import json
-import re
 import time
 from unittest.mock import MagicMock, patch
 
@@ -18,10 +17,12 @@ import handler
 
 SIGNING_SECRET = "test-signing-secret"
 BOT_TOKEN = "xoxb-test-token"
+USER_TOKEN = "xoxp-test-token"
 ANTHROPIC_KEY = "sk-ant-test"
 
 SECRETS = {
     "SLACK_BOT_TOKEN": BOT_TOKEN,
+    "SLACK_USER_TOKEN": USER_TOKEN,
     "SLACK_SIGNING_SECRET": SIGNING_SECRET,
     "ANTHROPIC_API_KEY": ANTHROPIC_KEY,
 }
@@ -62,7 +63,7 @@ def _api_gw_event(body: dict, valid_sig: bool = True) -> dict:
 def _patch_secrets():
     """Patch get_secrets for every test."""
     handler._secrets_cache.clear()
-    handler._channel_rules.clear()
+    handler._channel_enforced.clear()
     with patch.object(handler, "get_secrets", return_value=SECRETS):
         yield
 
@@ -121,59 +122,86 @@ class TestVerifySlackSignature:
 
 
 # ---------------------------------------------------------------------------
-# extract_regex_from_topic
+# is_channel_enforced
 # ---------------------------------------------------------------------------
 
 
-class TestExtractRegexFromTopic:
-    def test_happy_path(self):
-        topic = "🤬 Swearing mandatory | regex:/\\b(fuck|shit)\\b/i"
-        pat = handler.extract_regex_from_topic(topic)
-        assert pat is not None
-        assert pat.search("oh shit")
-        assert not pat.search("oh darn")
+class TestIsChannelEnforced:
+    def _mock_slack(self, topic: str) -> MagicMock:
+        slack = MagicMock()
+        slack.conversations_info.return_value = {
+            "channel": {"topic": {"value": topic}}
+        }
+        return slack
 
-    def test_case_insensitive_flag(self):
-        pat = handler.extract_regex_from_topic("regex:/hello/i")
-        assert pat is not None
-        assert pat.search("HELLO")
+    def test_emoji_marker(self):
+        slack = self._mock_slack("🤬 Filth mandatory here")
+        assert handler.is_channel_enforced(slack, "C1") is True
 
-    def test_no_regex_in_topic(self):
-        assert handler.extract_regex_from_topic("Just a normal topic") is None
+    def test_swearing_keyword(self):
+        slack = self._mock_slack("Swearing required | product team channel")
+        assert handler.is_channel_enforced(slack, "C2") is True
 
-    def test_empty_topic(self):
-        assert handler.extract_regex_from_topic("") is None
+    def test_filth_enforced_keyword(self):
+        slack = self._mock_slack("filth enforced | dev-banter")
+        assert handler.is_channel_enforced(slack, "C3") is True
 
-    def test_invalid_regex(self):
-        assert handler.extract_regex_from_topic("regex:/[invalid/") is None
+    def test_normal_topic_not_enforced(self):
+        slack = self._mock_slack("General discussion")
+        assert handler.is_channel_enforced(slack, "C4") is False
 
-    def test_multiline_flag(self):
-        pat = handler.extract_regex_from_topic("regex:/^hello/m")
-        assert pat is not None
-        assert pat.flags & re.MULTILINE
+    def test_empty_topic_not_enforced(self):
+        slack = self._mock_slack("")
+        assert handler.is_channel_enforced(slack, "C5") is False
 
-    def test_dotall_flag(self):
-        pat = handler.extract_regex_from_topic("regex:/a.b/s")
-        assert pat is not None
-        assert pat.flags & re.DOTALL
+    def test_result_is_cached(self):
+        slack = self._mock_slack("🤬 enforced")
+        handler.is_channel_enforced(slack, "C6")
+        handler.is_channel_enforced(slack, "C6")
+        # Should only hit the API once
+        assert slack.conversations_info.call_count == 1
 
-    def test_verbose_flag(self):
-        pat = handler.extract_regex_from_topic("regex:/a b/x")
-        assert pat is not None
-        assert pat.flags & re.VERBOSE
+    def test_api_error_returns_false(self):
+        from slack_sdk.errors import SlackApiError
+        slack = MagicMock()
+        slack.conversations_info.side_effect = SlackApiError(
+            "not_in_channel", MagicMock(data={"ok": False})
+        )
+        assert handler.is_channel_enforced(slack, "C7") is False
 
-    def test_multiple_flags(self):
-        pat = handler.extract_regex_from_topic("regex:/test/ims")
-        assert pat is not None
-        assert pat.flags & re.IGNORECASE
-        assert pat.flags & re.MULTILINE
-        assert pat.flags & re.DOTALL
 
-    def test_no_flags(self):
-        pat = handler.extract_regex_from_topic("regex:/hello/")
-        assert pat is not None
-        assert pat.search("hello")
-        assert not pat.search("HELLO")
+# ---------------------------------------------------------------------------
+# is_profane
+# ---------------------------------------------------------------------------
+
+
+class TestIsProfane:
+    @patch.object(handler, "get_claude_client")
+    def test_profane_message(self, mock_get_claude):
+        mock_claude = MagicMock()
+        mock_get_claude.return_value = mock_claude
+        mock_claude.messages.create.return_value = MagicMock(
+            content=[MagicMock(text="YES")]
+        )
+        assert handler.is_profane("what the fuck is going on") is True
+
+    @patch.object(handler, "get_claude_client")
+    def test_clean_message(self, mock_get_claude):
+        mock_claude = MagicMock()
+        mock_get_claude.return_value = mock_claude
+        mock_claude.messages.create.return_value = MagicMock(
+            content=[MagicMock(text="NO")]
+        )
+        assert handler.is_profane("good morning everyone") is False
+
+    @patch.object(handler, "get_claude_client")
+    def test_case_insensitive_yes(self, mock_get_claude):
+        mock_claude = MagicMock()
+        mock_get_claude.return_value = mock_claude
+        mock_claude.messages.create.return_value = MagicMock(
+            content=[MagicMock(text="yes")]
+        )
+        assert handler.is_profane("shit yeah") is True
 
 
 # ---------------------------------------------------------------------------
@@ -182,32 +210,10 @@ class TestExtractRegexFromTopic:
 
 
 class TestHandleMessageEvent:
-    @patch.object(handler, "get_slack_client")
-    def test_message_passes_regex_no_action(self, mock_get_slack):
-        """Message containing a swear word should pass without any action."""
+    def _enforced_slack(self):
         mock_slack = MagicMock()
-        mock_get_slack.return_value = mock_slack
         mock_slack.conversations_info.return_value = {
-            "channel": {"topic": {"value": "regex:/damn/i"}}
-        }
-
-        handler.handle_message_event(
-            {"channel": "C123", "text": "damn right", "user": "U1", "ts": "1.1"}
-        )
-
-        mock_slack.chat_delete.assert_not_called()
-        mock_slack.chat_postMessage.assert_not_called()
-
-    @patch.object(handler, "rewrite_message", return_value="bloody hell mate")
-    @patch.object(handler, "get_slack_client")
-    def test_message_too_clean_rewrite_and_repost(
-        self, mock_get_slack, mock_rewrite
-    ):
-        """Clean message should be deleted, rewritten, and reposted."""
-        mock_slack = MagicMock()
-        mock_get_slack.return_value = mock_slack
-        mock_slack.conversations_info.return_value = {
-            "channel": {"topic": {"value": "regex:/damn/i"}}
+            "channel": {"topic": {"value": "🤬 swearing required"}}
         }
         mock_slack.users_info.return_value = {
             "user": {
@@ -218,13 +224,38 @@ class TestHandleMessageEvent:
                 },
             }
         }
+        return mock_slack
+
+    @patch.object(handler, "is_profane", return_value=True)
+    @patch.object(handler, "get_slack_client")
+    def test_profane_message_no_action(self, mock_get_slack, mock_is_profane):
+        mock_get_slack.return_value = self._enforced_slack()
+
+        handler.handle_message_event(
+            {"channel": "C123", "text": "holy shit that's great", "user": "U1", "ts": "1.1"}
+        )
+
+        mock_get_slack.return_value.chat_delete.assert_not_called()
+        mock_get_slack.return_value.chat_postMessage.assert_not_called()
+
+    @patch.object(handler, "rewrite_message", return_value="bloody hell mate")
+    @patch.object(handler, "is_profane", return_value=False)
+    @patch.object(handler, "get_user_client")
+    @patch.object(handler, "get_slack_client")
+    def test_clean_message_rewrite_and_repost(
+        self, mock_get_slack, mock_get_user, mock_is_profane, mock_rewrite
+    ):
+        mock_slack = self._enforced_slack()
+        mock_get_slack.return_value = mock_slack
+        mock_user_slack = MagicMock()
+        mock_get_user.return_value = mock_user_slack
 
         handler.handle_message_event(
             {"channel": "C123", "text": "hello world", "user": "U1", "ts": "1.1"}
         )
 
-        mock_rewrite.assert_called_once()
-        mock_slack.chat_delete.assert_called_once_with(channel="C123", ts="1.1")
+        mock_rewrite.assert_called_once_with("hello world")
+        mock_user_slack.chat_delete.assert_called_once_with(channel="C123", ts="1.1")
         mock_slack.chat_postMessage.assert_called_once_with(
             channel="C123",
             text="bloody hell mate",
@@ -234,8 +265,6 @@ class TestHandleMessageEvent:
         mock_slack.chat_postEphemeral.assert_called_once()
 
     def test_bot_message_skipped(self):
-        """Bot messages should be silently skipped."""
-        # No mocks needed — should return before any Slack/Claude calls
         handler.handle_message_event(
             {
                 "bot_id": "B123",
@@ -247,7 +276,6 @@ class TestHandleMessageEvent:
         )
 
     def test_subtype_message_skipped(self):
-        """Messages with a subtype (e.g. message_changed) should be skipped."""
         handler.handle_message_event(
             {
                 "subtype": "message_changed",
@@ -264,12 +292,11 @@ class TestHandleMessageEvent:
         )
 
     @patch.object(handler, "get_slack_client")
-    def test_no_rule_for_channel(self, mock_get_slack):
-        """Channels without a regex topic should be ignored."""
+    def test_unenforced_channel_ignored(self, mock_get_slack):
         mock_slack = MagicMock()
         mock_get_slack.return_value = mock_slack
         mock_slack.conversations_info.return_value = {
-            "channel": {"topic": {"value": "No regex here"}}
+            "channel": {"topic": {"value": "Normal channel — polite discussion only"}}
         }
 
         handler.handle_message_event(
@@ -279,25 +306,19 @@ class TestHandleMessageEvent:
         mock_slack.chat_delete.assert_not_called()
 
     @patch.object(handler, "rewrite_message", return_value="damn it")
+    @patch.object(handler, "is_profane", return_value=False)
+    @patch.object(handler, "get_user_client")
     @patch.object(handler, "get_slack_client")
     def test_delete_fails_falls_back_to_thread(
-        self, mock_get_slack, mock_rewrite
+        self, mock_get_slack, mock_get_user, mock_is_profane, mock_rewrite
     ):
-        """If chat_delete fails, bot should reply in a thread instead."""
         from slack_sdk.errors import SlackApiError
 
-        mock_slack = MagicMock()
+        mock_slack = self._enforced_slack()
         mock_get_slack.return_value = mock_slack
-        mock_slack.conversations_info.return_value = {
-            "channel": {"topic": {"value": "regex:/damn/i"}}
-        }
-        mock_slack.users_info.return_value = {
-            "user": {
-                "real_name": "Test",
-                "profile": {"display_name": "testy", "image_72": ""},
-            }
-        }
-        mock_slack.chat_delete.side_effect = SlackApiError(
+        mock_user_slack = MagicMock()
+        mock_get_user.return_value = mock_user_slack
+        mock_user_slack.chat_delete.side_effect = SlackApiError(
             message="cant_delete", response=MagicMock(data={"ok": False})
         )
 
@@ -305,7 +326,6 @@ class TestHandleMessageEvent:
             {"channel": "C123", "text": "hello", "user": "U1", "ts": "1.1"}
         )
 
-        # Should fall back to thread reply
         mock_slack.chat_postMessage.assert_called_once()
         call_kwargs = mock_slack.chat_postMessage.call_args.kwargs
         assert call_kwargs["thread_ts"] == "1.1"
@@ -318,9 +338,9 @@ class TestHandleMessageEvent:
 
 class TestHandleTopicChange:
     def test_invalidates_cache(self):
-        handler._channel_rules["C123"] = re.compile(r"test")
+        handler._channel_enforced["C123"] = True
         handler.handle_topic_change({"channel": "C123"})
-        assert "C123" not in handler._channel_rules
+        assert "C123" not in handler._channel_enforced
 
     def test_no_channel_key(self):
         # Should not raise
